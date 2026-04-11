@@ -189,16 +189,35 @@ class ViTMoE(nn.Module):
             torch.zeros_like(stem_rearranged) for _ in range(4)
         ]
 
-        # Route each sample through its top-k experts
+        # Group samples by expert to perform batched forward passes (prevents OOM)
+        expert_to_batch = {i: [] for i in range(self.num_experts)}
+        expert_to_b_indices = {i: [] for i in range(self.num_experts)}
+        expert_to_weights = {i: [] for i in range(self.num_experts)}
+
         for k_idx in range(self.top_k):
             for b in range(B):
                 expert_idx = top_k_indices[b, k_idx].item()
                 weight = top_k_probs[b, k_idx]
+                
+                expert_to_batch[expert_idx].append(stem_rearranged[b])
+                expert_to_b_indices[expert_idx].append(b)
+                expert_to_weights[expert_idx].append(weight)
 
-                expert_out = self.experts[expert_idx](stem_rearranged[b:b+1])
-                # expert_out: list of 4 tensors, each (1, H, W, C)
+        for expert_idx in range(self.num_experts):
+            if len(expert_to_batch[expert_idx]) > 0:
+                expert_input = torch.stack(expert_to_batch[expert_idx], dim=0)
+                expert_weights = torch.stack(expert_to_weights[expert_idx], dim=0).view(-1, 1, 1, 1)
+                b_indices = torch.tensor(expert_to_b_indices[expert_idx], device=stem_out.device)
+                
+                expert_out = self.experts[expert_idx](expert_input)
+                
                 for layer_i in range(4):
-                    combined_outputs[layer_i][b] += weight * expert_out[layer_i][0]
+                    weighted_out = expert_out[layer_i] * expert_weights
+                    # index_add_ is autograd-friendly and safer than += over non-contiguous loops
+                    combined_outputs[layer_i].index_add_(0, b_indices, weighted_out)
+                    del weighted_out
+                    
+                del expert_input, expert_weights, b_indices, expert_out
 
         # Detach for reconstruction conditioning (same as original)
         outputs_map = [out.detach() for out in combined_outputs]
