@@ -106,17 +106,7 @@ class UniAD(nn.Module):
         moe_output = self.vit_moe(stem_out)
         outputs_map = moe_output["outputs_map"]
         
-        # Prepare intermediate layers for SVD loss
-        middle_decoder_feature_rec_0 = rearrange(
-            outputs_map[0], "b h w c -> b c (h w)"
-        )  
-        middle_decoder_feature_rec_1 = rearrange(
-            outputs_map[1], "b h w c -> b c (h w)"
-        )  
-        middle_decoder_feature_rec_2 = rearrange(
-            outputs_map[2], "b h w c -> b c (h w)"
-        )   
-        
+
         # The last layer is used for feature reconstruction
         output_decoder = rearrange(outputs_map[3], "b h w c -> (h w) b c")
         
@@ -148,9 +138,7 @@ class UniAD(nn.Module):
             "feature_rec": feature_rec,
             "feature_align": feature_align,
             "pred": pred,
-            "middle_decoder_feature_0": middle_decoder_feature_rec_0,
-            "middle_decoder_feature_1": middle_decoder_feature_rec_1,
-            "middle_decoder_feature_2": middle_decoder_feature_rec_2,
+
             "router_probs": moe_output.get("router_probs", None),
             "expert_indices": moe_output.get("expert_indices", None),
             "class_out": input.get("class_out", None),

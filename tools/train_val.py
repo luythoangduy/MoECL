@@ -19,7 +19,7 @@ from easydict import EasyDict
 from models.model_helper import ModelHelper
 from tensorboardX import SummaryWriter
 from torch.nn.parallel import DistributedDataParallel as DDP
-from utils.criterion_helper import build_criterion, build_svd_loss, build_locality_loss, build_load_balance_loss
+from utils.criterion_helper import build_criterion, build_locality_loss, build_load_balance_loss
 from utils.dist_helper import setup_distributed
 from utils.eval_helper import dump, log_metrics, merge_together, performances
 from utils.lr_helper import get_scheduler
@@ -189,7 +189,6 @@ def main():
         optimizer.add_feature_matrix(feature_metrix_cal(torch.load(resume_model)["feature_metrix"].copy()),logger)
 
     criterion = build_criterion(config.criterion)
-    SVDLoss = build_svd_loss()
     
     # MoE losses
     locality_loss_weight = config.get("locality_loss_weight", 1.0)
@@ -204,14 +203,24 @@ def main():
     if os.path.exists(replay_buffer_path):
         replay_buffer.load(replay_buffer_path)
     
-    # Snapshot experts for locality loss (if loading from a previous task)
-    if resume_model or load_path:
+    # Snapshot logic for LocalityLoss
+    if resume_model and os.path.exists(resume_model):
+        # Resuming from a crash in current task. Restore the previous task's snapshot from checkpoint memory.
+        try:
+            ckpt = torch.load(resume_model, map_location="cpu")
+            if "locality_snapshot" in ckpt and ckpt["locality_snapshot"]:
+                LocalityLoss.prev_expert_params = ckpt["locality_snapshot"]
+                logger.info("Locality loss: restored snapshot from resume_model.")
+        except Exception as e:
+            logger.warning("Failed to load locality snapshot: {}".format(e))
+    elif load_path:
+        # Starting a NEW task initialized with old task's weight. We MUST snapshot the old task's experts.
         try:
             reconstruction_module = getattr(model.module, 'reconstruction', None)
             if reconstruction_module is not None:
                 experts = reconstruction_module.get_experts()
                 LocalityLoss.snapshot_experts(experts)
-                logger.info("Locality loss: snapshotted {} experts from loaded checkpoint".format(
+                logger.info("Locality loss: snapshotted {} experts from loaded load_path".format(
                     len(list(experts))))
         except Exception as e:
             logger.warning("Could not snapshot experts for locality loss: {}".format(e))
@@ -234,7 +243,6 @@ def main():
             last_iter,
             tb_logger,
             criterion,
-            SVDLoss,
             LocalityLoss,
             BalanceLoss,
             replay_buffer,
@@ -263,6 +271,7 @@ def main():
                         "best_metric": best_metric,
                         "optimizer": optimizer.state_dict(),
                         "feature_metrix": outputs_dict,
+                        "locality_snapshot": LocalityLoss.prev_expert_params,
                     },
                     is_best,
                     config,
@@ -280,7 +289,6 @@ def train_one_epoch(
     start_iter,
     tb_logger,
     criterion,
-    SVDLoss,
     LocalityLoss,
     BalanceLoss,
     replay_buffer,
@@ -293,7 +301,6 @@ def train_one_epoch(
     data_time = AverageMeter(config.trainer.print_freq_step)
     
     losses = AverageMeter(config.trainer.print_freq_step)
-    losses_svd = AverageMeter(config.trainer.print_freq_step)
     losses_locality = AverageMeter(config.trainer.print_freq_step)
     losses_balance = AverageMeter(config.trainer.print_freq_step)
 
@@ -309,10 +316,6 @@ def train_one_epoch(
     rank = 0
     logger = logging.getLogger("global_logger")
     end = time.time()
-
-    concatenated_tensor_0 = torch.empty(0).cuda()
-    concatenated_tensor_1 = torch.empty(0).cuda()
-    concatenated_tensor_2 = torch.empty(0).cuda()
 
     for i, input in enumerate(train_loader):
         
@@ -334,22 +337,6 @@ def train_one_epoch(
             weight = criterion_loss.weight
             loss += weight * criterion_loss(outputs)
 
-        concatenated_tensor_0 = torch.cat([concatenated_tensor_0, outputs["middle_decoder_feature_0"].clone().detach()], dim=0)
-        concatenated_tensor_1 = torch.cat([concatenated_tensor_1, outputs["middle_decoder_feature_1"].clone().detach()], dim=0)
-        concatenated_tensor_2 = torch.cat([concatenated_tensor_2, outputs["middle_decoder_feature_2"].clone().detach()], dim=0)
-        
-        if concatenated_tensor_0.shape[0] > 768:
-            concatenated_tensor_0 = concatenated_tensor_0[48:]
-        
-        if concatenated_tensor_1.shape[0] > 768:
-            concatenated_tensor_1 = concatenated_tensor_1[48:]
-        
-        if concatenated_tensor_2.shape[0] > 768:
-            concatenated_tensor_2 = concatenated_tensor_2[48:]
-        
-        loss_svd = 0
-        loss_svd = SVDLoss(concatenated_tensor_0,concatenated_tensor_1,concatenated_tensor_2)
-
         # MoE Locality Loss: penalize expert weight drift
         router_probs = outputs["router_probs"]
         expert_indices = outputs["expert_indices"]
@@ -364,23 +351,19 @@ def train_one_epoch(
         # MoE Load Balance Loss: prevent expert collapse
         loss_balance = BalanceLoss(router_probs, expert_indices, num_experts)
 
-        if skip == True:
-            loss += 10*loss_svd
-        
         # Add MoE losses
         loss += LocalityLoss.weight * loss_locality
         loss += BalanceLoss.weight * loss_balance
 
-        # Store samples in replay buffer
-        replay_buffer.add_batch(input)
+        # Store samples in replay buffer ONLY AT THE LAST EPOCH!
+        if epoch == config.trainer.max_epoch - 1:
+            replay_buffer.add_batch(input)
 
         reduced_loss = loss.clone()
-        reduced_loss_svd = loss_svd.clone()
         reduced_loss_locality = loss_locality.clone().detach()
         reduced_loss_balance = loss_balance.clone().detach()
 
         losses.update(reduced_loss.item())
-        losses_svd.update(reduced_loss_svd.item())
         losses_locality.update(reduced_loss_locality.item())
         losses_balance.update(reduced_loss_balance.item())
 
@@ -399,7 +382,6 @@ def train_one_epoch(
 
         if (curr_step + 1) % config.trainer.print_freq_step == 0 and rank == 0:
             tb_logger.add_scalar("loss_train", losses.avg, curr_step + 1)
-            tb_logger.add_scalar("svd_loss", losses_svd.avg, curr_step + 1)
             tb_logger.add_scalar("locality_loss", losses_locality.avg, curr_step + 1)
             tb_logger.add_scalar("balance_loss", losses_balance.avg, curr_step + 1)
             tb_logger.add_scalar("lr", current_lr, curr_step + 1)
@@ -412,7 +394,6 @@ def train_one_epoch(
                 "Time {batch_time.val:.2f} ({batch_time.avg:.2f})\t"
                 "Data {data_time.val:.2f} ({data_time.avg:.2f})\t"
                 "Loss {loss.val:.5f} ({loss.avg:.5f})\t"
-                "Loss_SVD {loss_svd.val:.5f} ({loss_svd.avg:.5f})\t"
                 "Loss_Loc {loss_loc.val:.5f} ({loss_loc.avg:.5f})\t"
                 "Loss_Bal {loss_bal.val:.5f} ({loss_bal.avg:.5f})\t"
                 "LR {lr:.5f}\t".format(
@@ -423,7 +404,6 @@ def train_one_epoch(
                     batch_time=batch_time,
                     data_time=data_time,
                     loss=losses,
-                    loss_svd=losses_svd,
                     loss_loc=losses_locality,
                     loss_bal=losses_balance,
                     lr=current_lr,
