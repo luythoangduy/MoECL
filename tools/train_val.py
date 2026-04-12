@@ -213,17 +213,16 @@ def main():
                 logger.info("Locality loss: restored snapshot from resume_model.")
         except Exception as e:
             logger.warning("Failed to load locality snapshot: {}".format(e))
-    elif load_path:
-        # Starting a NEW task initialized with old task's weight. We MUST snapshot the old task's experts.
+    elif load_path and os.path.exists(load_path):
+        # Starting a NEW task initialized with old task's weight.
+        # We restore the snapshot generated at the very end of the PREVIOUS task.
         try:
-            reconstruction_module = getattr(model.module, 'reconstruction', None)
-            if reconstruction_module is not None:
-                experts = reconstruction_module.get_experts()
-                LocalityLoss.snapshot_experts(experts)
-                logger.info("Locality loss: snapshotted {} experts from loaded load_path".format(
-                    len(list(experts))))
+            ckpt = torch.load(load_path, map_location="cpu")
+            if "locality_snapshot" in ckpt and ckpt["locality_snapshot"]:
+                LocalityLoss.prev_expert_params = ckpt["locality_snapshot"]
+                logger.info("Locality loss: loaded previous task's experts from load_path ckpt.")
         except Exception as e:
-            logger.warning("Could not snapshot experts for locality loss: {}".format(e))
+            logger.warning("Failed to load locality snapshot from load_path: {}".format(e))
 
     # Get num_experts from model
     try:
@@ -255,6 +254,14 @@ def main():
         torch.cuda.empty_cache()
 
         if (epoch + 1) % config.trainer.val_freq_epoch == 0:
+            
+            # Snapthot the experts ONLY at the end of the task, so the NEXT task can use them
+            if epoch == config.trainer.max_epoch - 1:
+                reconstruction_module = getattr(model.module, 'reconstruction', None)
+                if reconstruction_module is not None:
+                    experts = reconstruction_module.get_experts()
+                    LocalityLoss.snapshot_experts(experts)
+
             if resume_model:
                 ret_metrics, outputs_dict = validate(train_val_loader, val_loader, model ,epoch + 1, ori_feature=torch.load(resume_model)["feature_metrix"])
             else:
