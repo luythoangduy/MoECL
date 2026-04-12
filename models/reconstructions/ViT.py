@@ -53,20 +53,6 @@ class MLP(nn.Module):
         x = rearrange(x, 'b (h w) d -> b h w d', h=int(x.size(1) ** 0.5))
         return x
 
-class ViTBlock(nn.Module):
-    def __init__(self, dim, num_patches, hidden_dim, num_heads, mlp_dim):
-        super(ViTBlock, self).__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.self_attention = MultiHeadSelfAttention(dim, num_heads)
-        self.norm2 = nn.LayerNorm(dim)
-        self.mlp = MLP(dim, mlp_dim)
-
-    def forward(self, x):
-        out = self.self_attention(self.norm1(x))
-        x = x + out
-        x = x + self.mlp(self.norm2(x))
-        return x
-
 
 # ============================================================
 # Mixture of Experts Components
@@ -100,59 +86,109 @@ class MoERouter(nn.Module):
         return top_k_probs, top_k_indices, all_probs
 
 
-class Expert(nn.Module):
+class ViTMoEBlock(nn.Module):
     """
-    A single expert consisting of multiple ViTBlocks.
-    Each expert specializes in reconstructing features for specific class(es).
+    Standard Vision-MoE Block architecture.
+    Provides shared Multi-Head Attention, and routes token features 
+    through parallel Feed-forward (MLP) experts.
     """
-    def __init__(self, hidden_dim, num_patches, num_heads, mlp_dim, num_blocks=4):
-        super(Expert, self).__init__()
-        self.vit_blocks = nn.ModuleList([
-            ViTBlock(hidden_dim, num_patches, hidden_dim, num_heads, mlp_dim)
-            for _ in range(num_blocks)
+    def __init__(self, dim, num_heads, mlp_dim, num_experts, top_k):
+        super(ViTMoEBlock, self).__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+        
+        self.norm1 = nn.LayerNorm(dim)
+        self.self_attention = MultiHeadSelfAttention(dim, num_heads)
+        self.norm2 = nn.LayerNorm(dim)
+        
+        self.router = MoERouter(dim, num_experts, top_k)
+        
+        # Parallel Feed-Forward layers (Experts)
+        self.experts = nn.ModuleList([
+            MLP(dim, mlp_dim) for _ in range(num_experts)
         ])
 
     def forward(self, x):
-        """
-        Args:
-            x: (B, H, W, C) stem features
-        Returns:
-            outputs_map: list of 4 tensors, each (B, H, W, C)
-        """
-        outputs_map = []
-        for block in self.vit_blocks:
-            x = block(x)
-            outputs_map.append(x)
-        return outputs_map
+        B = x.size(0)
+        
+        # Shared Multi-Head Attention branch
+        out = self.self_attention(self.norm1(x))
+        x = x + out
+        
+        # Norm for MoE routing
+        norm_x = self.norm2(x)
+        
+        # We perform Global Average Pool routing to align with original mechanism.
+        router_input = norm_x.mean(dim=[1, 2])
+        top_k_probs, top_k_indices, all_probs = self.router(router_input)
+        
+        combined_mlp_output = torch.zeros_like(x)
+        
+        # Group inputs by expert choice (Batch safe index mapping to avoid OOM)
+        expert_to_batch = {i: [] for i in range(self.num_experts)}
+        expert_to_b_indices = {i: [] for i in range(self.num_experts)}
+        expert_to_weights = {i: [] for i in range(self.num_experts)}
+
+        for k_idx in range(self.top_k):
+            for b in range(B):
+                expert_idx = top_k_indices[b, k_idx].item()
+                weight = top_k_probs[b, k_idx]
+                
+                expert_to_batch[expert_idx].append(norm_x[b])
+                expert_to_b_indices[expert_idx].append(b)
+                expert_to_weights[expert_idx].append(weight)
+
+        for expert_idx in range(self.num_experts):
+            if len(expert_to_batch[expert_idx]) > 0:
+                expert_input = torch.stack(expert_to_batch[expert_idx], dim=0)
+                expert_weights = torch.stack(expert_to_weights[expert_idx], dim=0).view(-1, 1, 1, 1)
+                b_indices = torch.tensor(expert_to_b_indices[expert_idx], device=x.device)
+                
+                # Execute mapped batches over appropriate MLP expert
+                expert_out = self.experts[expert_idx](expert_input)
+                
+                # Dynamic re-weighting
+                weighted_out = expert_out * expert_weights
+                combined_mlp_output.index_add_(0, b_indices, weighted_out)
+                
+        # Residual merge of output
+        x = x + combined_mlp_output
+        
+        return x, all_probs, top_k_indices
 
 
 class ViTMoE(nn.Module):
     """
     Vision Transformer with Mixture of Experts.
-    Replaces the original ViT classifier with a MoE architecture where
-    each expert = a full set of ViTBlocks, and a learned router
-    selects which expert(s) to activate per input.
-    
-    num_experts is fixed at total class count (e.g., 12 for VisA).
+    Utilizes 4 stacked ViTMoEBlocks containing Shared MHA and independent MoE MLP architectures.
     """
     def __init__(self, inplanes=3, hidden_dim=256, num_heads=4, mlp_dim=128,
-                 num_experts=12, top_k=1):
+                 num_experts=12, top_k=1, num_blocks=4):
         super(ViTMoE, self).__init__()
-        self.patch_size = 1
-        self.num_patches = inplanes * 14 * 14
-        self.embedding_dim = hidden_dim
         self.num_experts = num_experts
-        self.top_k = top_k
-        # Routers: one MoERouter per ViTBlock layer (4 layers)
-        self.routers = nn.ModuleList([
-            MoERouter(hidden_dim, num_experts, top_k) for _ in range(4)
+        
+        self.blocks = nn.ModuleList([
+            ViTMoEBlock(
+                dim=hidden_dim, 
+                num_heads=num_heads, 
+                mlp_dim=mlp_dim, 
+                num_experts=num_experts, 
+                top_k=top_k
+            ) for _ in range(num_blocks)
         ])
 
-        # Expert pool: each expert is a full set of 4 ViTBlocks
-        self.experts = nn.ModuleList([
-            Expert(hidden_dim, self.num_patches, num_heads, mlp_dim, num_blocks=4)
-            for _ in range(num_experts)
-        ])
+    def get_experts(self):
+        """
+        Dynamically bundles MLPs from successive layers into groups per expert index.
+        Provides a seamless interface for LocalityLoss iteration to track weights.
+        Returns: A list of nn.ModuleList grouped by expert.
+        """
+        expert_groups = []
+        for m in range(self.num_experts):
+            # nn.ModuleList supports iterating and .named_parameters() tracking
+            expert_mlps = nn.ModuleList([block.experts[m] for block in self.blocks])
+            expert_groups.append(expert_mlps)
+        return expert_groups
 
     def forward(self, stem_out):
         """
@@ -164,56 +200,18 @@ class ViTMoE(nn.Module):
                 "router_probs": (B*4, num_experts) full softmax probs across all layers
                 "expert_indices": (B*4, top_k) selected expert indices across all layers
         """
-        B = stem_out.size(0)
-        stem_rearranged = rearrange(stem_out, 'b c h w -> b h w c')  # (B, H, W, C)
+        x = rearrange(stem_out, 'b c h w -> b h w c')  # (B, H, W, C)
         
-        x = stem_rearranged
         outputs_map = []
         all_probs_list = []
         top_k_indices_list = []
-
-        for layer_i in range(4):
-            # Router input: global average pool of current spatial features
-            router_input = x.mean(dim=[1, 2])  # (B, hidden_dim)
-            top_k_probs, top_k_indices, all_probs = self.routers[layer_i](router_input)
+        
+        for block in self.blocks:
+            x, probs, indices = block(x)
+            outputs_map.append(x.detach())
+            all_probs_list.append(probs)
+            top_k_indices_list.append(indices)
             
-            all_probs_list.append(all_probs)
-            top_k_indices_list.append(top_k_indices)
-            
-            combined_output = torch.zeros_like(x)
-
-            # Group samples by expert to perform batched forward passes (prevents OOM)
-            expert_to_batch = {i: [] for i in range(self.num_experts)}
-            expert_to_b_indices = {i: [] for i in range(self.num_experts)}
-            expert_to_weights = {i: [] for i in range(self.num_experts)}
-
-            for k_idx in range(self.top_k):
-                for b in range(B):
-                    expert_idx = top_k_indices[b, k_idx].item()
-                    weight = top_k_probs[b, k_idx]
-                    
-                    expert_to_batch[expert_idx].append(x[b])
-                    expert_to_b_indices[expert_idx].append(b)
-                    expert_to_weights[expert_idx].append(weight)
-
-            for expert_idx in range(self.num_experts):
-                if len(expert_to_batch[expert_idx]) > 0:
-                    expert_input = torch.stack(expert_to_batch[expert_idx], dim=0)
-                    expert_weights = torch.stack(expert_to_weights[expert_idx], dim=0).view(-1, 1, 1, 1)
-                    b_indices = torch.tensor(expert_to_b_indices[expert_idx], device=stem_out.device)
-                    
-                    # Apply ONLY the block `layer_i` from the selected `expert_idx`
-                    expert_block = self.experts[expert_idx].vit_blocks[layer_i]
-                    expert_out = expert_block(expert_input)
-                    
-                    weighted_out = expert_out * expert_weights
-                    combined_output.index_add_(0, b_indices, weighted_out)
-                    
-            # Store the output for this layer, detached just like the original logic
-            outputs_map.append(combined_output.detach())
-            x = combined_output  # Next layer receives combined output
-
-        # Concatenate routing statistics from all 4 layers
         cat_probs = torch.cat(all_probs_list, dim=0)       # (B*4, num_experts)
         cat_indices = torch.cat(top_k_indices_list, dim=0) # (B*4, top_k)
 
