@@ -70,7 +70,7 @@ class UniAD(nn.Module):
         """
         Provide access to experts list for Continual Learning (e.g. LocalityLoss tracking)
         """
-        return self.vit_moe.experts
+        return self.vit_moe.get_experts()
     
     def add_jitter(self, feature_tokens, scale, prob):
         if random.uniform(0, 1) <= prob:
