@@ -143,13 +143,6 @@ class ViTMoE(nn.Module):
         self.embedding_dim = hidden_dim
         self.num_experts = num_experts
         self.top_k = top_k
-
-        # Shared stem (same as original ViT)
-        self.conv1 = nn.Conv2d(inplanes, hidden_dim, kernel_size=self.patch_size,
-                               stride=1, padding=0, bias=False)
-        self.bn1 = nn.BatchNorm2d(hidden_dim)
-        self.relu = nn.ReLU(inplace=True)
-
         # Router: takes GAP of stem features
         self.router = MoERouter(hidden_dim, num_experts, top_k)
 
@@ -159,20 +152,16 @@ class ViTMoE(nn.Module):
             for _ in range(num_experts)
         ])
 
-    def forward(self, x):
+    def forward(self, stem_out):
         """
         Args:
-            x: dict with key "image" -> (B, C, H, W)
+            stem_out: (B, hidden_dim, H, W) features from backbone/projection
         Returns:
             dict with:
                 "outputs_map": list of 4 tensors (B, H, W, C), detached
                 "router_probs": (B, num_experts) full softmax probs
                 "expert_indices": (B, top_k) selected expert indices
         """
-        # Shared stem
-        stem_out = self.conv1(x["image"])   # (B, hidden_dim, H, W)
-        stem_out = self.bn1(stem_out)
-        stem_out = self.relu(stem_out)
 
         # Router input: global average pool of stem
         router_input = stem_out.mean(dim=[2, 3])  # (B, hidden_dim)

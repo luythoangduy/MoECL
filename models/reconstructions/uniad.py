@@ -42,17 +42,14 @@ class UniAD(nn.Module):
         )
         self.save_recon = save_recon
 
-        self.transformer = Transformer(
-            hidden_dim, feature_size, neighbor_mask, **kwargs
-        )
         self.input_proj = nn.Linear(inplanes[0], hidden_dim)
         self.output_proj = nn.Linear(hidden_dim, inplanes[0])
 
         self.upsample = nn.UpsamplingBilinear2d(scale_factor=instrides[0])
         
-        # MoE ViT: num_experts = total class count, fixed across all stages
+        # Unified MoE transformer backbone
         self.vit_moe = ViTMoE(
-            inplanes=3, hidden_dim=hidden_dim, num_experts=num_experts, top_k=top_k
+            inplanes=hidden_dim, hidden_dim=hidden_dim, num_experts=num_experts, top_k=top_k
         )
 
         initialize_from_cfg(self, initializer)
@@ -70,7 +67,9 @@ class UniAD(nn.Module):
         return 1
     
     def get_experts(self):
-        """Get the MoE experts module list (for locality loss)."""
+        """
+        Provide access to experts list for Continual Learning (e.g. LocalityLoss tracking)
+        """
         return self.vit_moe.experts
     
     def add_jitter(self, feature_tokens, scale, prob):
@@ -86,12 +85,6 @@ class UniAD(nn.Module):
 
     def forward(self, input):
         
-        # MoE class condition extraction
-        moe_output = self.vit_moe(input)
-        input.update(moe_output)
-        
-        class_condition = input["outputs_map"] 
-        
         # For Reconstruction
         feature_align = input["feature_align"]  # B x C X H x W
         feature_tokens = rearrange(
@@ -103,29 +96,29 @@ class UniAD(nn.Module):
             )
         feature_tokens = self.input_proj(feature_tokens)  # (H x W) x B x C
         pos_embed = self.pos_embed(feature_tokens)  # (H x W) x C
-        output_decoder, _ = self.transformer(
-            feature_tokens, pos_embed, class_condition
-        )  # (H x W) x B x C
-        # print(output_decoder.size())
-        middle_decoder_feature=output_decoder[0:3,...]
-       
         
+        # Combine tokens and positional embeddings
+        tokens_with_pos = feature_tokens + pos_embed.unsqueeze(1)  # (H x W) x B x C
+        # Reshape to (B, C, H, W) for ViTMoE processing
+        stem_out = rearrange(tokens_with_pos, "(h w) b c -> b c h w", h=self.feature_size[0])
+        
+        # Replace Transformer with ViTMoE Router and Experts
+        moe_output = self.vit_moe(stem_out)
+        outputs_map = moe_output["outputs_map"]
+        
+        # Prepare intermediate layers for SVD loss
         middle_decoder_feature_rec_0 = rearrange(
-            middle_decoder_feature[0], "(h w) b c -> b c (h w)", h=self.feature_size[0]
+            outputs_map[0], "b h w c -> b c (h w)"
         )  
         middle_decoder_feature_rec_1 = rearrange(
-            middle_decoder_feature[1], "(h w) b c -> b c (h w)", h=self.feature_size[0]
+            outputs_map[1], "b h w c -> b c (h w)"
         )  
         middle_decoder_feature_rec_2 = rearrange(
-            middle_decoder_feature[2], "(h w) b c -> b c (h w)", h=self.feature_size[0]
+            outputs_map[2], "b h w c -> b c (h w)"
         )   
-        # print(middle_decoder_feature[0].size())
-        # print(middle_decoder_feature[1].size())
-        # print(middle_decoder_feature[2].size())
-        # print("FLAG")
-        # return
-    
-        output_decoder = output_decoder[3]
+        
+        # The last layer is used for feature reconstruction
+        output_decoder = rearrange(outputs_map[3], "b h w c -> (h w) b c")
         
         feature_rec_tokens = self.output_proj(output_decoder)  # (H x W) x B x C
         feature_rec = rearrange(
@@ -158,8 +151,9 @@ class UniAD(nn.Module):
             "middle_decoder_feature_0": middle_decoder_feature_rec_0,
             "middle_decoder_feature_1": middle_decoder_feature_rec_1,
             "middle_decoder_feature_2": middle_decoder_feature_rec_2,
-            "router_probs": input["router_probs"],
-            "expert_indices": input["expert_indices"],
+            "router_probs": moe_output.get("router_probs", None),
+            "expert_indices": moe_output.get("expert_indices", None),
+            "class_out": input.get("class_out", None),
         }
 
 
