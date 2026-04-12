@@ -103,7 +103,7 @@ class EvalImage:
 
     def encode_mask(self, masks):
         N, _, _ = masks.shape
-        masks = (masks.reshape(N, -1).sum(axis=1) != 0).astype(np.int)  # (N, )
+        masks = (masks.reshape(N, -1).sum(axis=1) != 0).astype(np.int8)  # (N, )
         return masks
 
     def eval_auc(self):

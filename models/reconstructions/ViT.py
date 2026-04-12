@@ -143,8 +143,10 @@ class ViTMoE(nn.Module):
         self.embedding_dim = hidden_dim
         self.num_experts = num_experts
         self.top_k = top_k
-        # Router: takes GAP of stem features
-        self.router = MoERouter(hidden_dim, num_experts, top_k)
+        # Routers: one MoERouter per ViTBlock layer (4 layers)
+        self.routers = nn.ModuleList([
+            MoERouter(hidden_dim, num_experts, top_k) for _ in range(4)
+        ])
 
         # Expert pool: each expert is a full set of 4 ViTBlocks
         self.experts = nn.ModuleList([
@@ -159,62 +161,66 @@ class ViTMoE(nn.Module):
         Returns:
             dict with:
                 "outputs_map": list of 4 tensors (B, H, W, C), detached
-                "router_probs": (B, num_experts) full softmax probs
-                "expert_indices": (B, top_k) selected expert indices
+                "router_probs": (B*4, num_experts) full softmax probs across all layers
+                "expert_indices": (B*4, top_k) selected expert indices across all layers
         """
-
-        # Router input: global average pool of stem
-        router_input = stem_out.mean(dim=[2, 3])  # (B, hidden_dim)
-        top_k_probs, top_k_indices, all_probs = self.router(router_input)
-        # top_k_probs:   (B, top_k)
-        # top_k_indices:  (B, top_k)
-        # all_probs:      (B, num_experts)
-
         B = stem_out.size(0)
         stem_rearranged = rearrange(stem_out, 'b c h w -> b h w c')  # (B, H, W, C)
+        
+        x = stem_rearranged
+        outputs_map = []
+        all_probs_list = []
+        top_k_indices_list = []
 
-        # Initialize combined output: list of 4 layers, each (B, H, W, C)
-        combined_outputs = [
-            torch.zeros_like(stem_rearranged) for _ in range(4)
-        ]
+        for layer_i in range(4):
+            # Router input: global average pool of current spatial features
+            router_input = x.mean(dim=[1, 2])  # (B, hidden_dim)
+            top_k_probs, top_k_indices, all_probs = self.routers[layer_i](router_input)
+            
+            all_probs_list.append(all_probs)
+            top_k_indices_list.append(top_k_indices)
+            
+            combined_output = torch.zeros_like(x)
 
-        # Group samples by expert to perform batched forward passes (prevents OOM)
-        expert_to_batch = {i: [] for i in range(self.num_experts)}
-        expert_to_b_indices = {i: [] for i in range(self.num_experts)}
-        expert_to_weights = {i: [] for i in range(self.num_experts)}
+            # Group samples by expert to perform batched forward passes (prevents OOM)
+            expert_to_batch = {i: [] for i in range(self.num_experts)}
+            expert_to_b_indices = {i: [] for i in range(self.num_experts)}
+            expert_to_weights = {i: [] for i in range(self.num_experts)}
 
-        for k_idx in range(self.top_k):
-            for b in range(B):
-                expert_idx = top_k_indices[b, k_idx].item()
-                weight = top_k_probs[b, k_idx]
-                
-                expert_to_batch[expert_idx].append(stem_rearranged[b])
-                expert_to_b_indices[expert_idx].append(b)
-                expert_to_weights[expert_idx].append(weight)
-
-        for expert_idx in range(self.num_experts):
-            if len(expert_to_batch[expert_idx]) > 0:
-                expert_input = torch.stack(expert_to_batch[expert_idx], dim=0)
-                expert_weights = torch.stack(expert_to_weights[expert_idx], dim=0).view(-1, 1, 1, 1)
-                b_indices = torch.tensor(expert_to_b_indices[expert_idx], device=stem_out.device)
-                
-                expert_out = self.experts[expert_idx](expert_input)
-                
-                for layer_i in range(4):
-                    weighted_out = expert_out[layer_i] * expert_weights
-                    # index_add_ is autograd-friendly and safer than += over non-contiguous loops
-                    combined_outputs[layer_i].index_add_(0, b_indices, weighted_out)
-                    del weighted_out
+            for k_idx in range(self.top_k):
+                for b in range(B):
+                    expert_idx = top_k_indices[b, k_idx].item()
+                    weight = top_k_probs[b, k_idx]
                     
-                del expert_input, expert_weights, b_indices, expert_out
+                    expert_to_batch[expert_idx].append(x[b])
+                    expert_to_b_indices[expert_idx].append(b)
+                    expert_to_weights[expert_idx].append(weight)
 
-        # Detach for reconstruction conditioning (same as original)
-        outputs_map = [out.detach() for out in combined_outputs]
+            for expert_idx in range(self.num_experts):
+                if len(expert_to_batch[expert_idx]) > 0:
+                    expert_input = torch.stack(expert_to_batch[expert_idx], dim=0)
+                    expert_weights = torch.stack(expert_to_weights[expert_idx], dim=0).view(-1, 1, 1, 1)
+                    b_indices = torch.tensor(expert_to_b_indices[expert_idx], device=stem_out.device)
+                    
+                    # Apply ONLY the block `layer_i` from the selected `expert_idx`
+                    expert_block = self.experts[expert_idx].vit_blocks[layer_i]
+                    expert_out = expert_block(expert_input)
+                    
+                    weighted_out = expert_out * expert_weights
+                    combined_output.index_add_(0, b_indices, weighted_out)
+                    
+            # Store the output for this layer, detached just like the original logic
+            outputs_map.append(combined_output.detach())
+            x = combined_output  # Next layer receives combined output
+
+        # Concatenate routing statistics from all 4 layers
+        cat_probs = torch.cat(all_probs_list, dim=0)       # (B*4, num_experts)
+        cat_indices = torch.cat(top_k_indices_list, dim=0) # (B*4, top_k)
 
         return {
             "outputs_map": outputs_map,
-            "router_probs": all_probs,        # (B, num_experts) - for locality loss
-            "expert_indices": top_k_indices,   # (B, top_k) - for logging/analysis
+            "router_probs": cat_probs,        # for locality and balance loss
+            "expert_indices": cat_indices,    # for balance loss
         }
 
 

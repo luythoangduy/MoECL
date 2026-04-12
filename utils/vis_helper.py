@@ -13,7 +13,7 @@ def normalize(pred, max_value=None, min_value=None):
 
 
 def apply_ad_scoremap(image, scoremap, alpha=0.5):
-    np_image = np.asarray(image, dtype=np.float)
+    np_image = np.asarray(image, dtype=np.float32)
     scoremap = (scoremap * 255).astype(np.uint8)
     scoremap = cv2.applyColorMap(scoremap, cv2.COLORMAP_JET)
     scoremap = cv2.cvtColor(scoremap, cv2.COLOR_BGR2RGB)

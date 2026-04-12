@@ -152,7 +152,7 @@ Here is our [Project Page](https://jqt.me/_IUF_/) with Video!
   ```
   In `run.sh`, it includes two stages:
   ```
-  cd /dataset/.../SmallDefect_Vis/IUF
+  #cd /dataset/.../SmallDefect_Vis/IUF
 
   # Stage 1: Training base objects
   CUDA_VISIBLE_DEVICES=0,1,2,3 python ./tools/train_val.py --config /dataset/.../SmallDefect_Vis/IUF/experiments/VisA/8_1_1_1_1/config_c1.yaml
@@ -205,6 +205,8 @@ If you have any questions, please feel free to send email to `jtang092@connect.h
 ## 📜 **Acknowledgment**
 The research work was sponsored by AIR@InnoHK.
 The code is inspired by [UniAD](https://github.com/zhiyuanyou/UniAD).
-#   M o E C L  
- #   M o E C L  
+#   M o E C L 
+ 
+ #   M o E C L 
+ 
  
